@@ -1,0 +1,75 @@
+name: Deploy to Gitea Maven Registry
+on:
+  push:
+    tags: ["g*"]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: "maven"
+      - name: Install Maven
+        run: |
+          curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz | tar xz -C /opt
+          echo "/opt/apache-maven-3.9.9/bin" >> $GITHUB_PATH
+      - name: Configure Maven settings
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << 'SETTINGS'
+          <settings>
+            <servers>
+              <server>
+                <id>gitea</id>
+                <username>${env.MAVEN_USERNAME}</username>
+                <password>${env.MAVEN_PASSWORD}</password>
+              </server>
+              <server>
+                <id>central</id>
+                <username>dummy</username>
+                <password>dummy</password>
+              </server>
+            </servers>
+            <mirrors>
+              <mirror>
+                <id>maven-default-http-blocker</id>
+                <mirrorOf>!gitea,external:http:*</mirrorOf>
+                <url>http://0.0.0.0/</url>
+                <blocked>true</blocked>
+              </mirror>
+            </mirrors>
+            <profiles>
+              <profile>
+                <id>gitea-registry</id>
+                <repositories>
+                  <repository>
+                    <id>gitea</id>
+                    <url>http://gitea:3000/api/packages/sol_root/maven</url>
+                    <releases><enabled>true</enabled></releases>
+                    <snapshots><enabled>true</enabled></snapshots>
+                  </repository>
+                  <repository>
+                    <id>central</id>
+                    <url>https://repo.maven.apache.org/maven2</url>
+                  </repository>
+                </repositories>
+              </profile>
+            </profiles>
+            <activeProfiles>
+              <activeProfile>gitea-registry</activeProfile>
+            </activeProfiles>
+          </settings>
+          SETTINGS
+      - name: Set version from tag
+        run: |
+          VERSION=${GITHUB_REF_NAME#g}
+          echo "Deploying version: $VERSION"
+          mvn versions:set -DnewVersion=$VERSION -DgenerateBackupPoms=false -q
+      - name: Deploy to Gitea Registry
+        run: mvn deploy -DskipTests -Dcentral-publishing.skip=true -Dgpg.skip=true
+        env:
+          MAVEN_USERNAME: sol_root
+          MAVEN_PASSWORD: ${{ secrets.MAVEN_REGISTRY_TOKEN }}

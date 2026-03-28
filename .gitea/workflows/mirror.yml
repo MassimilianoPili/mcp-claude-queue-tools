@@ -1,0 +1,36 @@
+name: Mirror to GitHub
+on:
+  push:
+    branches: [main]
+    tags: ["v*", "g*"]
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Ensure GitHub repo exists
+        run: |
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.GH_MIRROR_TOKEN }}" \
+            "https://api.github.com/repos/MassimilianoPili/$REPO_NAME")
+          if [ "$STATUS" != "200" ]; then
+            curl -sf -X POST \
+              -H "Authorization: token ${{ secrets.GH_MIRROR_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/user/repos" \
+              -d "{\"name\":\"$REPO_NAME\",\"description\":\"MCP Claude Queue Tools: inter-session task queue with PG + Redis + Preference Sort\",\"private\":false}"
+            echo "Created GitHub repo: $REPO_NAME"
+          fi
+      - name: Push to GitHub
+        run: |
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          mkdir -p ~/.ssh
+          echo "${{ secrets.MIRROR_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            git push --force git@github.com:MassimilianoPili/$REPO_NAME.git HEAD:main --tags
+          rm -f ~/.ssh/deploy_key

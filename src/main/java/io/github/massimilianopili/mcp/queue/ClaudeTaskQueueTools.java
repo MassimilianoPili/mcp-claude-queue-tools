@@ -60,16 +60,17 @@ public class ClaudeTaskQueueTools {
             @ToolParam(description = "Creating session label (e.g. 'chat-31')") String createdBy,
             @ToolParam(description = "Specific target label (null = anyone)", required = false) String targetLabel,
             @ToolParam(description = "Priority 1-10 (1=urgent, 5=default, 10=low)", required = false) Integer priority,
-            @ToolParam(description = "Comma-separated task IDs this task depends on (e.g. '3,5,12')", required = false) String dependsOn) {
+            @ToolParam(description = "Comma-separated task IDs this task depends on (e.g. '3,5,12')", required = false) String dependsOn,
+            @ToolParam(description = "Path to plan file (e.g. ~/.claude/plans/foo.md)", required = false) String planFile) {
 
         int prio = (priority != null) ? Math.max(1, Math.min(10, priority)) : 5;
         List<Long> depIds = parseDependsOn(dependsOn);
 
         return Mono.fromCallable(() -> {
             Long taskId = jdbc.queryForObject(
-                    "INSERT INTO claude_tasks (ref, task_type, payload_json, created_by, target_label, priority) " +
-                            "VALUES (?, ?, ?::jsonb, ?, ?, ?) RETURNING task_id",
-                    Long.class, ref, taskType, payloadJson, createdBy, targetLabel, prio);
+                    "INSERT INTO claude_tasks (ref, task_type, payload_json, created_by, target_label, priority, plan_file_path) " +
+                            "VALUES (?, ?, ?::jsonb, ?, ?, ?, ?) RETURNING task_id",
+                    Long.class, ref, taskType, payloadJson, createdBy, targetLabel, prio, planFile);
 
             List<String> depWarnings = new ArrayList<>();
             for (Long depId : depIds) {
@@ -107,8 +108,9 @@ public class ClaudeTaskQueueTools {
                     String.format(", depends on: %s", depIds.stream().map(id -> "#" + id).collect(Collectors.joining(",")));
             String warnStr = depWarnings.isEmpty() ? "" :
                     String.format("\nWARN deps not found: %s", String.join(", ", depWarnings));
-            return String.format("Task #%d enqueued (DB + %s) — ref: %s, type: %s, priority: %d%s%s",
-                    taskId, sinks, ref, taskType, prio, depStr, warnStr);
+            String planStr = (planFile != null && !planFile.isBlank()) ? ", plan: " + planFile : "";
+            return String.format("Task #%d enqueued (DB + %s) — ref: %s, type: %s, priority: %d%s%s%s",
+                    taskId, sinks, ref, taskType, prio, planStr, depStr, warnStr);
         }).subscribeOn(Schedulers.boundedElastic());
     }
 
@@ -137,7 +139,7 @@ public class ClaudeTaskQueueTools {
                     "UPDATE claude_tasks SET status = 'CLAIMED', claimed_by = ?, claimed_at = now() " +
                             "WHERE task_id = ? AND status = 'PENDING' " +
                             "RETURNING task_id, ref, task_type, payload_json::text, priority, created_by, " +
-                            "to_char(created_at, 'YYYY-MM-DD HH24:MI') as created",
+                            "to_char(created_at, 'YYYY-MM-DD HH24:MI') as created, plan_file_path",
                     claimedBy, taskId);
 
             if (rows.isEmpty()) {
@@ -145,11 +147,12 @@ public class ClaudeTaskQueueTools {
             }
 
             Map<String, Object> row = rows.getFirst();
-            return String.format("Task #%s claimed by %s\nRef: %s | Type: %s | Prio: %s | By: %s (%s)\nPayload: %s",
+            String planLine = row.get("plan_file_path") != null ? "\nPlan: " + row.get("plan_file_path") : "";
+            return String.format("Task #%s claimed by %s\nRef: %s | Type: %s | Prio: %s | By: %s (%s)\nPayload: %s%s",
                     row.get("task_id"), claimedBy,
                     row.get("ref"), row.get("task_type"), row.get("priority"),
                     row.get("created_by"), row.get("created"),
-                    row.get("payload_json"));
+                    row.get("payload_json"), planLine);
         }).subscribeOn(Schedulers.boundedElastic());
     }
 
@@ -232,6 +235,7 @@ public class ClaudeTaskQueueTools {
                             "coalesce(t.claimed_by, '') as claimed_by, " +
                             "to_char(t.created_at, 'MM-DD HH24:MI') as created, " +
                             "CASE WHEN t.redis_key IS NOT NULL THEN 'Y' ELSE 'N' END as redis, " +
+                            "CASE WHEN t.plan_file_path IS NOT NULL THEN 'Y' ELSE 'N' END as has_plan, " +
                             "left(t.payload_json::text, 200) as payload_preview, " +
                             "coalesce(array_agg(d.depends_on_id) FILTER (WHERE d.depends_on_id IS NOT NULL), '{}') as deps " +
                             "FROM claude_tasks t " +
@@ -259,9 +263,10 @@ public class ClaudeTaskQueueTools {
                 boolean blocked = "PENDING".equals(statusVal) && deps.length > 0 &&
                         Arrays.stream(deps).anyMatch(id -> !"COMPLETED".equals(taskStatuses.getOrDefault(id, "UNKNOWN")));
 
-                result.add(String.format("#%-4s  %-20s [%-12s]  prio:%-2s  %s%s  by:%-10s  claimed:%-10s  %s  redis:%s\n       %s",
+                String planFlag = "Y".equals(r.get("has_plan")) ? " [plan]" : "";
+                result.add(String.format("#%-4s  %-20s [%-12s]  prio:%-2s  %s%s%s  by:%-10s  claimed:%-10s  %s  redis:%s\n       %s",
                         r.get("task_id"), r.get("ref"), r.get("task_type"),
-                        r.get("priority"), statusVal, blocked ? " [BLOCKED]" : "",
+                        r.get("priority"), statusVal, blocked ? " [BLOCKED]" : "", planFlag,
                         r.get("created_by"), r.get("claimed_by"),
                         depStr, r.get("redis"),
                         r.get("payload_preview")));

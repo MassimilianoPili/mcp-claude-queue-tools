@@ -7,7 +7,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -30,22 +29,19 @@ public class ClaudeTaskQueueTools {
 
     private static final Logger log = LoggerFactory.getLogger(ClaudeTaskQueueTools.class);
 
-    @Value("${mcp.taskqueue.rank-api:http://preference-sort:8093}")
-    private String rankApi;
-
-    @Value("${mcp.taskqueue.rank-user:f7294891-b031-432d-8382-8592d3e6b1aa}")
-    private String rankUser;
-
     private final JdbcTemplate jdbc;
     private final ReactiveStringRedisTemplate msg;
+    private final QueueProperties props;
     private final HttpClient http = HttpClient.newHttpClient();
     private final ObjectMapper mapper = new ObjectMapper();
 
     public ClaudeTaskQueueTools(
             @Qualifier("taskQueueDataSource") javax.sql.DataSource dataSource,
-            @Qualifier("mcpRedisMessagingTemplate") ReactiveStringRedisTemplate msg) {
+            @Qualifier("mcpRedisMessagingTemplate") ReactiveStringRedisTemplate msg,
+            QueueProperties props) {
         this.jdbc = new JdbcTemplate(dataSource);
         this.msg = msg;
+        this.props = props;
         log.info("ClaudeTaskQueueTools initialized (DB + Redis + Preference Sort)");
     }
 
@@ -63,7 +59,7 @@ public class ClaudeTaskQueueTools {
             @ToolParam(description = "Comma-separated task IDs this task depends on (e.g. '3,5,12')", required = false) String dependsOn,
             @ToolParam(description = "Path to plan file (e.g. ~/.claude/plans/foo.md)", required = false) String planFile) {
 
-        int prio = (priority != null) ? Math.max(1, Math.min(10, priority)) : 5;
+        int prio = (priority != null) ? Math.max(1, Math.min(10, priority)) : props.getDefaultPriority();
         List<Long> depIds = parseDependsOn(dependsOn);
 
         return Mono.fromCallable(() -> {
@@ -86,8 +82,8 @@ public class ClaudeTaskQueueTools {
                     taskId, ref, prio, taskType, depIds.size());
             boolean redisOk = false;
             try {
-                msg.opsForList().leftPush("claude:taskq", redisMsg).block();
-                jdbc.update("UPDATE claude_tasks SET redis_key = 'claude:taskq', dispatched_at = now() WHERE task_id = ?", taskId);
+                msg.opsForList().leftPush(props.getRedisKey(), redisMsg).block();
+                jdbc.update("UPDATE claude_tasks SET redis_key = ?, dispatched_at = now() WHERE task_id = ?", props.getRedisKey(), taskId);
                 redisOk = true;
             } catch (Exception e) {
                 log.warn("Redis dispatch failed for task #{}: {}", taskId, e.getMessage());
@@ -198,8 +194,8 @@ public class ClaudeTaskQueueTools {
 
             Long taskId = jdbc.queryForObject(
                     "INSERT INTO claude_tasks (ref, task_type, payload_json, created_by, priority) " +
-                            "VALUES (?, 'progress', ?::jsonb, ?, 10) RETURNING task_id",
-                    Long.class, ref, payload, createdBy);
+                            "VALUES (?, 'progress', ?::jsonb, ?, ?) RETURNING task_id",
+                    Long.class, ref, payload, createdBy, props.getProgressPriority());
 
             return String.format("Progress saved as task #%d (ref: %s). Next session: claude_task_list('ALL').",
                     taskId, ref);
@@ -218,7 +214,7 @@ public class ClaudeTaskQueueTools {
 
         if ("RANKED".equals(filter)) return claudeTaskListRanked();
 
-        int maxRows = (limit != null && limit > 0) ? Math.min(limit, 500) : 20;
+        int maxRows = (limit != null && limit > 0) ? Math.min(limit, props.getMaxLimit()) : props.getDefaultLimit();
         int skip = (offset != null && offset >= 0) ? offset : 0;
 
         String where = switch (filter) {
@@ -304,16 +300,17 @@ public class ClaudeTaskQueueTools {
 
     private String findOrCreateTaskQueueList() throws Exception {
         HttpRequest req = HttpRequest.newBuilder()
-                .uri(URI.create(rankApi + "/lists?limit=100"))
-                .header("X-Auth-User-Id", rankUser).GET().build();
+                .uri(URI.create(props.getPreferenceSortApiUrl() + "/lists?limit=100"))
+                .header("X-Auth-User-Id", props.getPreferenceSortUserId()).GET().build();
         JsonNode lists = mapper.readTree(http.send(req, HttpResponse.BodyHandlers.ofString()).body());
         for (JsonNode list : lists) {
-            if ("task-queue".equals(list.path("category").asText())) return list.path("id").asText();
+            if (props.getTaskQueueCategory().equals(list.path("category").asText())) return list.path("id").asText();
         }
-        String body = "{\"name\":\"Task Queue\",\"category\":\"task-queue\",\"ig_threshold\":0.01}";
+        String body = String.format("{\"name\":\"Task Queue\",\"category\":\"%s\",\"ig_threshold\":%s}",
+                props.getTaskQueueCategory(), props.getIgThreshold());
         HttpRequest create = HttpRequest.newBuilder()
-                .uri(URI.create(rankApi + "/lists"))
-                .header("X-Auth-User-Id", rankUser)
+                .uri(URI.create(props.getPreferenceSortApiUrl() + "/lists"))
+                .header("X-Auth-User-Id", props.getPreferenceSortUserId())
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body)).build();
         JsonNode created = mapper.readTree(http.send(create, HttpResponse.BodyHandlers.ofString()).body());
@@ -324,8 +321,8 @@ public class ClaudeTaskQueueTools {
         String itemName = String.format("#%d %s [%s]", taskId, ref, taskType);
         String body = String.format("{\"items\":[{\"name\":\"%s\"}]}", itemName);
         HttpRequest req = HttpRequest.newBuilder()
-                .uri(URI.create(rankApi + "/lists/" + listUuid + "/items"))
-                .header("X-Auth-User-Id", rankUser)
+                .uri(URI.create(props.getPreferenceSortApiUrl() + "/lists/" + listUuid + "/items"))
+                .header("X-Auth-User-Id", props.getPreferenceSortUserId())
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body)).build();
         JsonNode resp = mapper.readTree(http.send(req, HttpResponse.BodyHandlers.ofString()).body());
@@ -342,8 +339,8 @@ public class ClaudeTaskQueueTools {
         String itemUuid = rows.getFirst().get("rank_item_uuid").toString();
         String listUuid = findOrCreateTaskQueueList();
         HttpRequest req = HttpRequest.newBuilder()
-                .uri(URI.create(rankApi + "/lists/" + listUuid + "/items/" + itemUuid))
-                .header("X-Auth-User-Id", rankUser).DELETE().build();
+                .uri(URI.create(props.getPreferenceSortApiUrl() + "/lists/" + listUuid + "/items/" + itemUuid))
+                .header("X-Auth-User-Id", props.getPreferenceSortUserId()).DELETE().build();
         http.send(req, HttpResponse.BodyHandlers.ofString());
         jdbc.update("UPDATE claude_tasks SET rank_item_uuid = NULL WHERE task_id = ?", taskId);
     }
@@ -360,8 +357,8 @@ public class ClaudeTaskQueueTools {
             }
 
             HttpRequest rankReq = HttpRequest.newBuilder()
-                    .uri(URI.create(rankApi + "/lists/" + listUuid + "/ranking"))
-                    .header("X-Auth-User-Id", rankUser).GET().build();
+                    .uri(URI.create(props.getPreferenceSortApiUrl() + "/lists/" + listUuid + "/ranking"))
+                    .header("X-Auth-User-Id", props.getPreferenceSortUserId()).GET().build();
             JsonNode ranking = mapper.readTree(http.send(rankReq, HttpResponse.BodyHandlers.ofString()).body());
 
             boolean converged = ranking.path("converged").asBoolean(false);

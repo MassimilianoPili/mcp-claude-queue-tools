@@ -1,7 +1,7 @@
-name: Deploy to Gitea Maven Registry
+name: Deploy to Maven Central
 on:
   push:
-    tags: ["g*"]
+    tags: ["v*"]
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -16,6 +16,8 @@ jobs:
         run: |
           curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz | tar xz -C /opt
           echo "/opt/apache-maven-3.9.9/bin" >> $GITHUB_PATH
+      - name: Import GPG key
+        run: echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
       - name: Configure Maven settings
         run: |
           mkdir -p ~/.m2
@@ -23,24 +25,16 @@ jobs:
           <settings>
             <servers>
               <server>
+                <id>central</id>
+                <username>${env.CENTRAL_USERNAME}</username>
+                <password>${env.CENTRAL_PASSWORD}</password>
+              </server>
+              <server>
                 <id>gitea</id>
                 <username>${env.MAVEN_USERNAME}</username>
                 <password>${env.MAVEN_PASSWORD}</password>
               </server>
-              <server>
-                <id>central</id>
-                <username>dummy</username>
-                <password>dummy</password>
-              </server>
             </servers>
-            <mirrors>
-              <mirror>
-                <id>maven-default-http-blocker</id>
-                <mirrorOf>!gitea,external:http:*</mirrorOf>
-                <url>http://0.0.0.0/</url>
-                <blocked>true</blocked>
-              </mirror>
-            </mirrors>
             <profiles>
               <profile>
                 <id>gitea-registry</id>
@@ -65,30 +59,14 @@ jobs:
           SETTINGS
       - name: Set version from tag
         run: |
-          VERSION=${GITHUB_REF_NAME#g}
-          echo "Deploying version: $VERSION"
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "Publishing version: $VERSION"
           mvn versions:set -DnewVersion=$VERSION -DgenerateBackupPoms=false -q
-      - name: Deploy to Gitea Registry
-        run: |
-          ARTIFACT_ID=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
-          VERSION=${GITHUB_REF_NAME#g}
-          mvn package -DskipTests -Dgpg.skip=true
-          mvn deploy:deploy-file \
-            -Dfile=target/${ARTIFACT_ID}-${VERSION}.jar \
-            -Dsources=target/${ARTIFACT_ID}-${VERSION}-sources.jar \
-            -Djavadoc=target/${ARTIFACT_ID}-${VERSION}-javadoc.jar \
-            -DpomFile=pom.xml \
-            -DrepositoryId=gitea \
-            -Durl=http://gitea:3000/api/packages/sol_root/maven \
-            -s ~/.m2/settings.xml
+      - name: Deploy to Maven Central
+        run: mvn deploy -DskipTests
         env:
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
           MAVEN_USERNAME: sol_root
           MAVEN_PASSWORD: ${{ secrets.MAVEN_REGISTRY_TOKEN }}
-      - name: Trigger MCP server redeploy
-        if: success()
-        run: |
-          curl -sf -X POST \
-            -H "X-Deploy-Token: ${{ secrets.DEPLOY_WEBHOOK_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d "{\"artifact\":\"${GITHUB_REPOSITORY##*/}\",\"version\":\"${GITHUB_REF_NAME#g}\"}" \
-            http://172.17.0.1:7690/deploy || echo "Webhook failed (non-blocking)"
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}

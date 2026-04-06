@@ -179,6 +179,54 @@ public class ClaudeTaskQueueTools {
         }).subscribeOn(Schedulers.boundedElastic());
     }
 
+    @ReactiveTool(name = "claude_task_set_priority",
+            description = "Updates the priority of an existing task. Only PENDING or CLAIMED tasks can be re-prioritized.")
+    public Mono<String> claudeTaskSetPriority(
+            @ToolParam(description = "Task ID") Long taskId,
+            @ToolParam(description = "New priority 1-10 (1=urgent, 5=default, 10=low)") Integer priority) {
+
+        int prio = Math.max(1, Math.min(10, priority));
+
+        return Mono.fromCallable(() -> {
+            List<Map<String, Object>> rows = jdbc.queryForList(
+                    "UPDATE claude_tasks SET priority = ? WHERE task_id = ? AND status IN ('PENDING','CLAIMED') " +
+                            "RETURNING task_id, ref, priority",
+                    prio, taskId);
+
+            if (rows.isEmpty()) {
+                return "ERROR: Task #" + taskId + " not found or already completed/failed";
+            }
+
+            Map<String, Object> row = rows.getFirst();
+            return String.format("Task #%s priority → %s (ref: %s)", row.get("task_id"), row.get("priority"), row.get("ref"));
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    @ReactiveTool(name = "claude_task_update_plan",
+            description = "Updates or sets the plan file path of an existing task. Only PENDING or CLAIMED tasks.")
+    public Mono<String> claudeTaskUpdatePlan(
+            @ToolParam(description = "Task ID") Long taskId,
+            @ToolParam(description = "New plan file path (e.g. ~/.claude/plans/foo.md), or empty string to clear") String planFile) {
+
+        String path = (planFile == null || planFile.isBlank()) ? null : planFile;
+
+        return Mono.fromCallable(() -> {
+            List<Map<String, Object>> rows = jdbc.queryForList(
+                    "UPDATE claude_tasks SET plan_file_path = ? WHERE task_id = ? AND status IN ('PENDING','CLAIMED') " +
+                            "RETURNING task_id, ref, plan_file_path",
+                    path, taskId);
+
+            if (rows.isEmpty()) {
+                return "ERROR: Task #" + taskId + " not found or already completed/failed";
+            }
+
+            Map<String, Object> row = rows.getFirst();
+            return path != null
+                    ? String.format("Task #%s plan → %s (ref: %s)", row.get("task_id"), row.get("plan_file_path"), row.get("ref"))
+                    : String.format("Task #%s plan cleared (ref: %s)", row.get("task_id"), row.get("ref"));
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+
     @ReactiveTool(name = "claude_progress_persist",
             description = "Saves a progress snapshot in claude_tasks as task_type='progress'. " +
                     "Useful for cross-session continuity.")

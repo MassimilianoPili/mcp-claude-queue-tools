@@ -283,18 +283,32 @@ public class ClaudeTaskQueueTools {
         int maxRows = (limit != null && limit > 0) ? Math.min(limit, props.getMaxLimit()) : props.getDefaultLimit();
         int skip = (offset != null && offset >= 0) ? offset : 0;
 
+        // Build WHERE clause with parameterized values for user inputs
         StringBuilder where = new StringBuilder(switch (filter) {
             case "DISPATCHED" -> "dispatched_at IS NOT NULL AND status NOT IN ('COMPLETED','FAILED','CANCELLED')";
             case "ALL" -> "TRUE";
             default -> "status = '" + filter + "'";
         });
-        if (tier != null && tier >= 1 && tier <= 4) where.append(" AND t.tier <= ").append(tier);
-        if (category != null && !category.isBlank()) where.append(" AND t.category = '").append(category.replace("'", "''")).append("'");
+        List<Object> whereParams = new ArrayList<>();
+        if (tier != null && tier >= 1 && tier <= 4) {
+            where.append(" AND t.tier <= ?");
+            whereParams.add(tier);
+        }
+        if (category != null && !category.isBlank()) {
+            where.append(" AND t.category = ?");
+            whereParams.add(category);
+        }
 
         String whereStr = where.toString();
 
         return Mono.fromCallable(() -> {
-            int totalCount = jdbc.queryForObject("SELECT count(*) FROM claude_tasks t WHERE " + whereStr, Integer.class);
+            int totalCount = jdbc.queryForObject(
+                    "SELECT count(*) FROM claude_tasks t WHERE " + whereStr,
+                    Integer.class, whereParams.toArray());
+
+            List<Object> queryParams = new ArrayList<>(whereParams);
+            queryParams.add(maxRows);
+            queryParams.add(skip);
 
             List<Map<String, Object>> rows = jdbc.queryForList(
                     "SELECT t.task_id, t.ref, t.task_type, t.priority, t.status, t.created_by, " +
@@ -305,14 +319,15 @@ public class ClaudeTaskQueueTools {
                             "left(t.payload_json::text, 200) as payload_preview, " +
                             "t.impact, t.urgency, t.effort, t.confidence, t.tier, t.category, " +
                             "t.static_score, t.bt_score, t.bt_comparisons, " +
-                            "ag_catalog.task_final_score(t.static_score, t.bt_score, t.bt_comparisons, t.due_date::date, t.created_at) as final_score, " +
+                            "ag_catalog.task_final_score(t.static_score, t.bt_score, t.bt_comparisons, t.due_date, t.created_at) as final_score, " +
                             "coalesce(array_agg(d.depends_on_id) FILTER (WHERE d.depends_on_id IS NOT NULL), '{}') as deps " +
                             "FROM claude_tasks t " +
                             "LEFT JOIN claude_task_deps d ON d.task_id = t.task_id " +
                             "WHERE " + whereStr +
                             " GROUP BY t.task_id " +
-                            "ORDER BY ag_catalog.task_final_score(t.static_score, t.bt_score, t.bt_comparisons, t.due_date::date, t.created_at) DESC" +
-                            " LIMIT " + maxRows + " OFFSET " + skip);
+                            "ORDER BY ag_catalog.task_final_score(t.static_score, t.bt_score, t.bt_comparisons, t.due_date, t.created_at) DESC" +
+                            " LIMIT ? OFFSET ?",
+                    queryParams.toArray());
 
             Map<Long, String> taskStatuses = new HashMap<>();
             jdbc.queryForList("SELECT task_id, status FROM claude_tasks")

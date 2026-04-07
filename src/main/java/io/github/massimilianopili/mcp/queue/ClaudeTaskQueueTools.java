@@ -57,16 +57,32 @@ public class ClaudeTaskQueueTools {
             @ToolParam(description = "Specific target label (null = anyone)", required = false) String targetLabel,
             @ToolParam(description = "Priority 1-10 (1=urgent, 5=default, 10=low)", required = false) Integer priority,
             @ToolParam(description = "Comma-separated task IDs this task depends on (e.g. '3,5,12')", required = false) String dependsOn,
-            @ToolParam(description = "Path to plan file (e.g. ~/.claude/plans/foo.md)", required = false) String planFile) {
+            @ToolParam(description = "Path to plan file (e.g. ~/.claude/plans/foo.md)", required = false) String planFile,
+            @ToolParam(description = "Impact 1-10 (1=minimal, 10=critical)", required = false) Integer impact,
+            @ToolParam(description = "Effort 1-5 (1=<1h, 2=hours, 3=day, 4=days, 5=week+)", required = false) Integer effort,
+            @ToolParam(description = "Confidence 1-5 (how sure about impact/effort estimates)", required = false) Integer confidence,
+            @ToolParam(description = "Urgency 1-10 (1=no rush, 10=do now)", required = false) Integer urgency,
+            @ToolParam(description = "Deadline ISO date (e.g. '2026-05-01'), null if none", required = false) String deadline,
+            @ToolParam(description = "Tier 1-4 (1=must, 2=should, 3=could, 4=wont)", required = false) Integer tier,
+            @ToolParam(description = "Category: ops, code, research, project, security, awareness", required = false) String category) {
 
         int prio = (priority != null) ? Math.max(1, Math.min(10, priority)) : props.getDefaultPriority();
+        Integer clampedImpact = clamp(impact, 1, 10);
+        Integer clampedEffort = clamp(effort, 1, 5);
+        Integer clampedConfidence = clamp(confidence, 1, 5);
+        Integer clampedUrgency = clamp(urgency, 1, 10);
+        Integer clampedTier = clamp(tier, 1, 4);
+        java.sql.Date parsedDeadline = parseDate(deadline);
         List<Long> depIds = parseDependsOn(dependsOn);
 
         return Mono.fromCallable(() -> {
             Long taskId = jdbc.queryForObject(
-                    "INSERT INTO claude_tasks (ref, task_type, payload_json, created_by, target_label, priority, plan_file_path) " +
-                            "VALUES (?, ?, ?::jsonb, ?, ?, ?, ?) RETURNING task_id",
-                    Long.class, ref, taskType, payloadJson, createdBy, targetLabel, prio, planFile);
+                    "INSERT INTO claude_tasks (ref, task_type, payload_json, created_by, target_label, priority, " +
+                            "plan_file_path, impact, effort, confidence, urgency, due_date, tier, category) " +
+                            "VALUES (?, ?, ?::jsonb, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING task_id",
+                    Long.class, ref, taskType, payloadJson, createdBy, targetLabel, prio,
+                    planFile, clampedImpact, clampedEffort, clampedConfidence, clampedUrgency,
+                    parsedDeadline, clampedTier, category);
 
             List<String> depWarnings = new ArrayList<>();
             for (Long depId : depIds) {
@@ -256,7 +272,9 @@ public class ClaudeTaskQueueTools {
     public Mono<List<String>> claudeTaskList(
             @ToolParam(description = "Filter: PENDING, CLAIMED, COMPLETED, FAILED, DISPATCHED, RANKED, ALL", required = false) String status,
             @ToolParam(description = "Max results (default 20, max 500)", required = false) Integer limit,
-            @ToolParam(description = "Rows to skip for pagination (default 0)", required = false) Integer offset) {
+            @ToolParam(description = "Rows to skip for pagination (default 0)", required = false) Integer offset,
+            @ToolParam(description = "Max tier to show (1=must only, 2=must+should, default=all)", required = false) Integer tier,
+            @ToolParam(description = "Filter by category: ops, code, research, project, security, awareness", required = false) String category) {
 
         String filter = (status != null) ? status.toUpperCase() : "PENDING";
 
@@ -265,14 +283,18 @@ public class ClaudeTaskQueueTools {
         int maxRows = (limit != null && limit > 0) ? Math.min(limit, props.getMaxLimit()) : props.getDefaultLimit();
         int skip = (offset != null && offset >= 0) ? offset : 0;
 
-        String where = switch (filter) {
+        StringBuilder where = new StringBuilder(switch (filter) {
             case "DISPATCHED" -> "dispatched_at IS NOT NULL AND status NOT IN ('COMPLETED','FAILED','CANCELLED')";
             case "ALL" -> "TRUE";
             default -> "status = '" + filter + "'";
-        };
+        });
+        if (tier != null && tier >= 1 && tier <= 4) where.append(" AND t.tier <= ").append(tier);
+        if (category != null && !category.isBlank()) where.append(" AND t.category = '").append(category.replace("'", "''")).append("'");
+
+        String whereStr = where.toString();
 
         return Mono.fromCallable(() -> {
-            int totalCount = jdbc.queryForObject("SELECT count(*) FROM claude_tasks t WHERE " + where, Integer.class);
+            int totalCount = jdbc.queryForObject("SELECT count(*) FROM claude_tasks t WHERE " + whereStr, Integer.class);
 
             List<Map<String, Object>> rows = jdbc.queryForList(
                     "SELECT t.task_id, t.ref, t.task_type, t.priority, t.status, t.created_by, " +
@@ -281,11 +303,15 @@ public class ClaudeTaskQueueTools {
                             "CASE WHEN t.redis_key IS NOT NULL THEN 'Y' ELSE 'N' END as redis, " +
                             "CASE WHEN t.plan_file_path IS NOT NULL THEN 'Y' ELSE 'N' END as has_plan, " +
                             "left(t.payload_json::text, 200) as payload_preview, " +
+                            "t.impact, t.urgency, t.effort, t.confidence, t.tier, t.category, " +
+                            "t.static_score, t.bt_score, t.bt_comparisons, " +
+                            "ag_catalog.task_final_score(t.static_score, t.bt_score, t.bt_comparisons, t.due_date::date, t.created_at) as final_score, " +
                             "coalesce(array_agg(d.depends_on_id) FILTER (WHERE d.depends_on_id IS NOT NULL), '{}') as deps " +
                             "FROM claude_tasks t " +
                             "LEFT JOIN claude_task_deps d ON d.task_id = t.task_id " +
-                            "WHERE " + where +
-                            " GROUP BY t.task_id ORDER BY t.priority, t.created_at" +
+                            "WHERE " + whereStr +
+                            " GROUP BY t.task_id " +
+                            "ORDER BY ag_catalog.task_final_score(t.static_score, t.bt_score, t.bt_comparisons, t.due_date::date, t.created_at) DESC" +
                             " LIMIT " + maxRows + " OFFSET " + skip);
 
             Map<Long, String> taskStatuses = new HashMap<>();
@@ -308,9 +334,14 @@ public class ClaudeTaskQueueTools {
                         Arrays.stream(deps).anyMatch(id -> !"COMPLETED".equals(taskStatuses.getOrDefault(id, "UNKNOWN")));
 
                 String planFlag = "Y".equals(r.get("has_plan")) ? " [plan]" : "";
-                result.add(String.format("#%-4s  %-20s [%-12s]  prio:%-2s  %s%s%s  by:%-10s  claimed:%-10s  %s  redis:%s\n       %s",
+                Object fs = r.get("final_score");
+                String scoreStr = fs != null ? String.format("%.2f", ((Number) fs).doubleValue()) : "-";
+                String dimStr = formatDimensions(r);
+
+                result.add(String.format("#%-4s  %-20s [%-8s]  %s  score:%-5s  %s%s%s  by:%-10s  claimed:%-10s  %s  redis:%s\n       %s",
                         r.get("task_id"), r.get("ref"), r.get("task_type"),
-                        r.get("priority"), statusVal, blocked ? " [BLOCKED]" : "", planFlag,
+                        dimStr, scoreStr,
+                        statusVal, blocked ? " [BLOCKED]" : "", planFlag,
                         r.get("created_by"), r.get("claimed_by"),
                         depStr, r.get("redis"),
                         r.get("payload_preview")));
@@ -321,7 +352,85 @@ public class ClaudeTaskQueueTools {
         }).subscribeOn(Schedulers.boundedElastic());
     }
 
+    // ── Dimensions ─────────────────────────────────────────
+
+    @ReactiveTool(name = "claude_task_set_dimensions",
+            description = "Update dimensional scores of an existing task. Each param is optional — only provided values are updated. " +
+                    "Only PENDING or CLAIMED tasks can be updated.")
+    public Mono<String> claudeTaskSetDimensions(
+            @ToolParam(description = "Task ID") Long taskId,
+            @ToolParam(description = "Impact 1-10 (1=minimal, 10=critical)", required = false) Integer impact,
+            @ToolParam(description = "Effort 1-5 (1=<1h, 2=hours, 3=day, 4=days, 5=week+)", required = false) Integer effort,
+            @ToolParam(description = "Confidence 1-5 (how sure about impact/effort estimates)", required = false) Integer confidence,
+            @ToolParam(description = "Urgency 1-10 (1=no rush, 10=do now)", required = false) Integer urgency,
+            @ToolParam(description = "Deadline ISO date (e.g. '2026-05-01'), 'clear' to remove", required = false) String deadline,
+            @ToolParam(description = "Tier 1-4 (1=must, 2=should, 3=could, 4=wont)", required = false) Integer tier,
+            @ToolParam(description = "Category: ops, code, research, project, security, awareness", required = false) String category,
+            @ToolParam(description = "How many other tasks this unblocks", required = false) Integer blocksCount,
+            @ToolParam(description = "Bradley-Terry score from Preference Sort", required = false) Double btScore,
+            @ToolParam(description = "Number of BT pairwise comparisons", required = false) Integer btComparisons) {
+
+        return Mono.fromCallable(() -> {
+            List<String> setClauses = new ArrayList<>();
+            List<Object> params = new ArrayList<>();
+
+            if (impact != null) { setClauses.add("impact = ?"); params.add(Math.max(1, Math.min(10, impact))); }
+            if (effort != null) { setClauses.add("effort = ?"); params.add(Math.max(1, Math.min(5, effort))); }
+            if (confidence != null) { setClauses.add("confidence = ?"); params.add(Math.max(1, Math.min(5, confidence))); }
+            if (urgency != null) { setClauses.add("urgency = ?"); params.add(Math.max(1, Math.min(10, urgency))); }
+            if (deadline != null) {
+                if ("clear".equalsIgnoreCase(deadline)) {
+                    setClauses.add("due_date = NULL");
+                } else {
+                    setClauses.add("due_date = ?::date"); params.add(deadline);
+                }
+            }
+            if (tier != null) { setClauses.add("tier = ?"); params.add(Math.max(1, Math.min(4, tier))); }
+            if (category != null) { setClauses.add("category = ?"); params.add(category); }
+            if (blocksCount != null) { setClauses.add("blocks_count = ?"); params.add(Math.max(0, blocksCount)); }
+            if (btScore != null) { setClauses.add("bt_score = ?"); params.add(btScore); }
+            if (btComparisons != null) { setClauses.add("bt_comparisons = ?"); params.add(Math.max(0, btComparisons)); }
+
+            if (setClauses.isEmpty()) return "ERROR: No dimensions provided to update";
+
+            params.add(taskId);
+            String sql = "UPDATE claude_tasks SET " + String.join(", ", setClauses) +
+                    " WHERE task_id = ? AND status IN ('PENDING','CLAIMED') RETURNING task_id, ref, static_score";
+
+            List<Map<String, Object>> rows = jdbc.queryForList(sql, params.toArray());
+            if (rows.isEmpty()) return "ERROR: Task #" + taskId + " not found or already completed/failed";
+
+            Map<String, Object> row = rows.getFirst();
+            Object ss = row.get("static_score");
+            String scoreStr = ss != null ? String.format("%.3f", ((Number) ss).doubleValue()) : "-";
+            return String.format("Task #%s dimensions updated (ref: %s, static_score: %s)", row.get("task_id"), row.get("ref"), scoreStr);
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+
     // ── Helpers ─────────────────────────────────────────────
+
+    private static Integer clamp(Integer value, int min, int max) {
+        if (value == null) return null;
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private static java.sql.Date parseDate(String dateStr) {
+        if (dateStr == null || dateStr.isBlank()) return null;
+        try { return java.sql.Date.valueOf(dateStr); }
+        catch (IllegalArgumentException e) { return null; }
+    }
+
+    private static String formatDimensions(Map<String, Object> r) {
+        StringBuilder sb = new StringBuilder();
+        Object imp = r.get("impact"), urg = r.get("urgency"), eff = r.get("effort"),
+               conf = r.get("confidence"), t = r.get("tier");
+        sb.append("I:").append(imp != null ? imp : "-");
+        sb.append(" U:").append(urg != null ? urg : "-");
+        sb.append(" E:").append(eff != null ? eff : "-");
+        sb.append(" C:").append(conf != null ? conf : "-");
+        sb.append(" T:").append(t != null ? t : "-");
+        return sb.toString();
+    }
 
     private List<Long> parseDependsOn(String dependsOn) {
         if (dependsOn == null || dependsOn.isBlank()) return List.of();

@@ -389,22 +389,24 @@ public class ClaudeTaskQueueTools {
             List<String> setClauses = new ArrayList<>();
             List<Object> params = new ArrayList<>();
 
-            if (impact != null) { setClauses.add("impact = ?"); params.add(Math.max(1, Math.min(10, impact))); }
-            if (effort != null) { setClauses.add("effort = ?"); params.add(Math.max(1, Math.min(5, effort))); }
-            if (confidence != null) { setClauses.add("confidence = ?"); params.add(Math.max(1, Math.min(5, confidence))); }
-            if (urgency != null) { setClauses.add("urgency = ?"); params.add(Math.max(1, Math.min(10, urgency))); }
-            if (deadline != null) {
+            // Note: Spring AI MCP deserializes omitted Integer params as 0, not null.
+            // Treat 0 as "not provided" since all scales start at 1.
+            if (isSet(impact)) { setClauses.add("impact = ?"); params.add(Math.max(1, Math.min(10, impact))); }
+            if (isSet(effort)) { setClauses.add("effort = ?"); params.add(Math.max(1, Math.min(5, effort))); }
+            if (isSet(confidence)) { setClauses.add("confidence = ?"); params.add(Math.max(1, Math.min(5, confidence))); }
+            if (isSet(urgency)) { setClauses.add("urgency = ?"); params.add(Math.max(1, Math.min(10, urgency))); }
+            if (deadline != null && !deadline.isEmpty()) {
                 if ("clear".equalsIgnoreCase(deadline)) {
                     setClauses.add("due_date = NULL");
                 } else {
                     setClauses.add("due_date = ?::date"); params.add(deadline);
                 }
             }
-            if (tier != null) { setClauses.add("tier = ?"); params.add(Math.max(1, Math.min(4, tier))); }
-            if (category != null) { setClauses.add("category = ?"); params.add(category); }
-            if (blocksCount != null) { setClauses.add("blocks_count = ?"); params.add(Math.max(0, blocksCount)); }
+            if (isSet(tier)) { setClauses.add("tier = ?"); params.add(Math.max(1, Math.min(4, tier))); }
+            if (category != null && !category.isEmpty()) { setClauses.add("category = ?"); params.add(category); }
+            if (blocksCount != null && blocksCount >= 0) { setClauses.add("blocks_count = ?"); params.add(blocksCount); }
             if (btScore != null) { setClauses.add("bt_score = ?"); params.add(btScore); }
-            if (btComparisons != null) { setClauses.add("bt_comparisons = ?"); params.add(Math.max(0, btComparisons)); }
+            if (isSet(btComparisons)) { setClauses.add("bt_comparisons = ?"); params.add(btComparisons); }
 
             if (setClauses.isEmpty()) return "ERROR: No dimensions provided to update";
 
@@ -424,8 +426,12 @@ public class ClaudeTaskQueueTools {
 
     // ── Helpers ─────────────────────────────────────────────
 
+    private static boolean isSet(Integer value) {
+        return value != null && value != 0;
+    }
+
     private static Integer clamp(Integer value, int min, int max) {
-        if (value == null) return null;
+        if (!isSet(value)) return null;
         return Math.max(min, Math.min(max, value));
     }
 
